@@ -18,23 +18,24 @@ import httpx
 
 API = os.environ["API_URL"].rstrip("/")            # https://<service>.onrender.com
 KEY = os.environ.get("ACCESS_KEY", "")             # same ACCESS_KEY you set on Render
-PAGE_ID = os.environ["FB_PAGE_ID"]
-PAGE_TOKEN = os.environ["FB_PAGE_TOKEN"]           # long-lived PAGE access token
+PAGE_ID = os.environ.get("FB_PAGE_ID", "").strip()
+PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN", "").strip()   # long-lived PAGE access token (leave empty for YouTube only)
+USE_FB = bool(PAGE_ID and PAGE_TOKEN) and os.environ.get("SKIP_FB", "").lower() != "true"  # False = YouTube only
 NICHE = os.environ.get("NICHE", "").strip()        # e.g. "personal finance tips for beginners"
-AUDIENCE = os.environ.get("AUDIENCE", "a general audience")
+AUDIENCE = (os.environ.get("AUDIENCE") or "a general audience").strip()
 LLM_KEY = os.environ.get("LLM_API_KEY", "")        # Groq key, used only to invent a fresh topic each day
-LLM_URL = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
-FB_MODE = os.environ.get("FB_MODE", "auto")        # auto = Reel when 90s or less, normal video when longer | reel | video
-FB_STATE = os.environ.get("FB_STATE", "PUBLISHED") # set DRAFT to test without going public
+LLM_URL = (os.environ.get("LLM_BASE_URL") or "https://api.groq.com/openai/v1").strip()
+LLM_MODEL = (os.environ.get("LLM_MODEL") or "llama-3.3-70b-versatile").strip()
+FB_MODE = (os.environ.get("FB_MODE") or "auto").strip()        # auto = Reel when 90s or less, normal video when longer | reel | video
+FB_STATE = (os.environ.get("FB_STATE") or "PUBLISHED").strip() # set DRAFT to test without going public
 DRY_RUN = os.environ.get("DRY_RUN", "") == "true"  # make the video but do not post
 DURATIONS = [int(x) for x in re.split(r"[,\s]+", os.environ.get("DURATIONS", "30,60,90")) if x in ("30", "60", "90", "120")] or [60]
 DURATION_CHOICE = os.environ.get("DURATION", "").strip()   # "30" | "60" | "90" | "120" | "" / "auto" = random from DURATIONS
 TOPIC_OVERRIDE = os.environ.get("TOPIC", "").strip()       # type a topic in "Run workflow" to force it: "black bear" or "topic | subject"
-STYLE = os.environ.get("STYLE", "cinematic")
-TONE = os.environ.get("TONE", "energetic")
-MUSIC_STYLE = os.environ.get("MUSIC_STYLE", "cinematic")
-FB_ASPECT = os.environ.get("FB_ASPECT", "9:16")
+STYLE = (os.environ.get("STYLE") or "cinematic").strip()
+TONE = (os.environ.get("TONE") or "energetic").strip()
+MUSIC_STYLE = (os.environ.get("MUSIC_STYLE") or "cinematic").strip()
+FB_ASPECT = (os.environ.get("FB_ASPECT") or "9:16").strip()
 GRAPH = "https://graph.facebook.com/v25.0"
 RUPLOAD = "https://rupload.facebook.com/video-upload/v25.0"
 H = {"X-Access-Key": KEY}
@@ -450,9 +451,12 @@ def pick_duration() -> int:
 
 def main():
     R["dry_run"] = DRY_RUN
-    R["stage"] = "checking the Facebook token"
-    if not DRY_RUN:
+    if USE_FB and not DRY_RUN:
+        R["stage"] = "checking the Facebook token"
         check_token()  # fail fast, before spending minutes on a video
+    elif not USE_FB:
+        R["youtube_only"] = True
+        log("Facebook is off (no FB secrets or SKIP_FB=true): making the video for YouTube only")
     R["stage"] = "choosing a topic"
     history = load_history()
     log(f"{len(history)} earlier posts on record")
@@ -523,12 +527,16 @@ def main():
             "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}])
         log("recorded in", HISTORY)
 
-    R["stage"] = "uploading to Facebook"
     t1 = time.time()
-    if as_reel:
-        post_reel(path, caption, record)
+    if USE_FB:
+        R["stage"] = "uploading to Facebook"
+        if as_reel:
+            post_reel(path, caption, record)
+        else:
+            post_video(path, title, caption, record)
     else:
-        post_video(path, title, caption, record)
+        R["stage"] = "video ready for YouTube"
+        record("")  # remember the topic; the next workflow step (youtube_upload.py) does the actual upload
     R["upload_seconds"] = round(time.time() - t1)
     R["stage"] = "done"
     log("done")
