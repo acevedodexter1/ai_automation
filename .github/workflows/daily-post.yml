@@ -1,20 +1,22 @@
-name: Daily Facebook post
+name: Daily YouTube post
 
 on:
   schedule:
     - cron: "0 4,12 * * *"   # UTC. 04:00 and 12:00 UTC = 12:00 PM and 8:00 PM in UTC+8 (Philippines).
   workflow_dispatch:           # lets you run it by hand from the Actions tab
     inputs:
-      dry_run:
-        description: "Make the video but do not post"
-        default: "false"
+      privacy:                 # CHANGED: replaces dry_run / youtube_test. Use "private" to test safely.
+        description: "YouTube privacy for this run (scheduled runs use the YT_PRIVACY variable, default public)"
+        type: choice
+        options: [public, unlisted, private]
+        default: private
       quality:
         description: "Video quality: standard (720p) or high (1080p)"
         type: choice
         options: [standard, high]
         default: standard
       duration:
-        description: "Length in seconds (auto = random pick of 30 / 60 / 90; all of these post as full-screen Reels)"
+        description: "Length in seconds (auto = random pick of 30 / 60 / 90)"
         type: choice
         options: [auto, "30", "60", "90", "120"]
         default: auto
@@ -23,9 +25,6 @@ on:
         type: choice
         options: [cinematic, epic, upbeat, calm, playful]
         default: cinematic
-      youtube_test:
-        description: "With dry_run = true, also upload to YouTube as PRIVATE to test the connection"
-        default: "false"
       topic:
         description: "Optional: force a topic, e.g. black bear   (or: topic | subject)"
         required: false
@@ -57,7 +56,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
           pip install -r backend/requirements.txt
 
-      - name: Start backend on the runner and post
+      - name: Start backend on the runner and make the video
         id: post
         env:
           # ---- backend settings (same values as render.yaml) ----
@@ -65,44 +64,44 @@ jobs:
           LLM_BACKEND: api
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_MODEL: openai/gpt-oss-120b
-          LLM_FALLBACK_BACKENDS: "hf_api"        # if Groq is rate-limited, try Hugging Face (needs HF_TOKEN with credits)
+          LLM_FALLBACK_BACKENDS: "hf_api"
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           LLM_FALLBACK_MODELS: openai/gpt-oss-20b,llama-3.1-8b-instant
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          IMAGE_BACKEND: stock                   # several free footage sources, best match wins
+          IMAGE_BACKEND: stock
           STOCK_PROVIDERS: nasa,wikimedia,archive,smithsonian,pixabay,pexels
-          STOCK_AI_FALLBACK: "true"              # no matching clip -> AI picture (Cloudflare FLUX), never gradient shapes
-          STOCK_CONTACT: ${{ vars.STOCK_CONTACT }}                 # optional: your email, sent in the User-Agent
-          SMITHSONIAN_API_KEY: ${{ secrets.SMITHSONIAN_API_KEY }}  # free: api.data.gov/signup (optional)
+          STOCK_AI_FALLBACK: "true"
+          STOCK_CONTACT: ${{ vars.STOCK_CONTACT }}
+          SMITHSONIAN_API_KEY: ${{ secrets.SMITHSONIAN_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}            # optional
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           TTS_BACKEND: cloudflare
-          TTS_FALLBACK: kokoro                   # if the free Cloudflare voice allowance runs out, narrate with Kokoro instead
-          TTS_FALLBACK_INSTALL: "true"            # lets the run install Kokoro by itself, only on days it is needed
+          TTS_FALLBACK: kokoro
+          TTS_FALLBACK_INSTALL: "true"
           VIDEO_BACKEND: none
           FFMPEG_THREADS: "2"
           KEN_BURNS: "true"
-          VIDEO_QUALITY: ${{ github.event.inputs.quality || 'standard' }}   # scheduled runs use the word after || ; change it to high when you are happy
+          VIDEO_QUALITY: ${{ github.event.inputs.quality || 'standard' }}
           MAX_CONCURRENT_JOBS: "1"
           MAX_QUEUE: "1"
           STORAGE_LIMIT_MB: "2000"
           # ---- posting settings ----
-          API_URL: http://127.0.0.1:8000        # the backend runs on this same runner
-          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
-          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
+          API_URL: http://127.0.0.1:8000
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}        # not used now, kept in case the script still reads it
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}  # not used now, kept in case the script still reads it
           NICHE: ${{ vars.NICHE }}
           AUDIENCE: ${{ vars.AUDIENCE }}
-          FB_MODE: auto                          # auto = Reel up to 90s, normal video above | reel | video
+          FB_MODE: auto
           STYLE: cinematic
           TONE: energetic
-          MUSIC_STYLE: ${{ github.event.inputs.music || 'cinematic' }}   # scheduled runs use the word after || ; options: cinematic, epic, upbeat, calm, playful
-          MUSIC_DIR: ${{ github.workspace }}/assets/music   # your own royalty-free tracks; empty folder = built-in music
-          DURATIONS: "30,60,90"                  # what 'auto' picks from (Reels are 90 s at most; 120 posts as a normal video)
+          MUSIC_STYLE: ${{ github.event.inputs.music || 'cinematic' }}
+          MUSIC_DIR: ${{ github.workspace }}/assets/music
+          DURATIONS: "30,60,90"
           DURATION: ${{ github.event.inputs.duration }}
           TOPIC: ${{ github.event.inputs.topic }}
-          FB_STATE: PUBLISHED                        # DRAFT for the first real test; change to PUBLISHED when it looks right
-          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          FB_STATE: PUBLISHED
+          DRY_RUN: "true"                  # CHANGED: always "make the video but do not post" -> nothing goes to Facebook
         run: |
           cd backend
           nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > ../backend.log 2>&1 &
@@ -119,7 +118,7 @@ jobs:
         run: tail -n 100 backend.log
 
       - name: Save the list of posted topics
-        if: always() && github.event.inputs.dry_run != 'true'
+        if: always()                       # CHANGED: no more dry_run check
         run: |
           if [ -n "$(git status --porcelain data/posted.json)" ]; then
             git config user.name "github-actions[bot]"
@@ -130,16 +129,16 @@ jobs:
             git push
           fi
 
-      - name: Upload the same video to YouTube
+      - name: Upload the video to YouTube
         id: youtube
-        if: steps.post.outcome == 'success' && (github.event.inputs.dry_run != 'true' || github.event.inputs.youtube_test == 'true')
-        timeout-minutes: 20              # it can never hang the run
-        continue-on-error: true          # a YouTube problem must never turn the Facebook post into a failed run
+        if: steps.post.outcome == 'success'   # CHANGED: runs on every successful video
+        timeout-minutes: 20
+        continue-on-error: true
         env:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
-          YT_PRIVACY: ${{ github.event.inputs.dry_run == 'true' && 'private' || (vars.YT_PRIVACY || 'public') }}
+          YT_PRIVACY: ${{ github.event.inputs.privacy || vars.YT_PRIVACY || 'public' }}   # CHANGED
         run: |
           python scripts/youtube_upload.py 2>&1 | tee -a run.log
           rc=${PIPESTATUS[0]}
