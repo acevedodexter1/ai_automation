@@ -5,7 +5,7 @@ on:
     - cron: "0 4,12 * * *"   # UTC. 04:00 and 12:00 UTC = 12:00 PM and 8:00 PM in UTC+8 (Philippines).
   workflow_dispatch:           # lets you run it by hand from the Actions tab
     inputs:
-      privacy:                 # CHANGED: replaces dry_run / youtube_test. Use "private" to test safely.
+      privacy:
         description: "YouTube privacy for this run (scheduled runs use the YT_PRIVACY variable, default public)"
         type: choice
         options: [public, unlisted, private]
@@ -88,11 +88,10 @@ jobs:
           STORAGE_LIMIT_MB: "2000"
           # ---- posting settings ----
           API_URL: http://127.0.0.1:8000
-          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}        # not used now, kept in case the script still reads it
-          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}  # not used now, kept in case the script still reads it
+          SKIP_FB: "true"                  # YouTube only: Facebook is switched off
+          DRY_RUN: "false"                 # must be false so the topic is recorded (no repeats)
           NICHE: ${{ vars.NICHE }}
-          AUDIENCE: ${{ vars.AUDIENCE }}
-          FB_MODE: auto
+          AUDIENCE: ${{ vars.AUDIENCE }}   # empty is fine, the script falls back to "a general audience"
           STYLE: cinematic
           TONE: energetic
           MUSIC_STYLE: ${{ github.event.inputs.music || 'cinematic' }}
@@ -100,8 +99,6 @@ jobs:
           DURATIONS: "30,60,90"
           DURATION: ${{ github.event.inputs.duration }}
           TOPIC: ${{ github.event.inputs.topic }}
-          FB_STATE: PUBLISHED
-          DRY_RUN: "true"                  # CHANGED: always "make the video but do not post" -> nothing goes to Facebook
         run: |
           cd backend
           nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > ../backend.log 2>&1 &
@@ -117,8 +114,25 @@ jobs:
         if: failure()
         run: tail -n 100 backend.log
 
+      - name: Upload the video to YouTube
+        id: youtube
+        if: steps.post.outcome == 'success'
+        timeout-minutes: 20
+        continue-on-error: true
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_PRIVACY: ${{ github.event.inputs.privacy || vars.YT_PRIVACY || 'public' }}
+        run: |
+          python scripts/youtube_upload.py 2>&1 | tee -a run.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" = "2" ]; then exit 0; fi   # 2 = no YouTube secrets set yet, simply skip
+          exit "$rc"
+
+      # Moved AFTER the upload and only on success: if YouTube fails, the topic is not used up.
       - name: Save the list of posted topics
-        if: always()                       # CHANGED: no more dry_run check
+        if: steps.youtube.outcome == 'success'
         run: |
           if [ -n "$(git status --porcelain data/posted.json)" ]; then
             git config user.name "github-actions[bot]"
@@ -128,22 +142,6 @@ jobs:
             git pull --rebase
             git push
           fi
-
-      - name: Upload the video to YouTube
-        id: youtube
-        if: steps.post.outcome == 'success'   # CHANGED: runs on every successful video
-        timeout-minutes: 20
-        continue-on-error: true
-        env:
-          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
-          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
-          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
-          YT_PRIVACY: ${{ github.event.inputs.privacy || vars.YT_PRIVACY || 'public' }}   # CHANGED
-        run: |
-          python scripts/youtube_upload.py 2>&1 | tee -a run.log
-          rc=${PIPESTATUS[0]}
-          if [ "$rc" = "2" ]; then exit 0; fi   # 2 = no YouTube secrets set yet, simply skip
-          exit "$rc"
 
       - name: Keep the video for download
         if: always()
@@ -162,6 +160,5 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           OUTCOME: ${{ steps.post.outcome }}
-          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python scripts/notify.py
