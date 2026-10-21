@@ -1,557 +1,167 @@
-#!/usr/bin/env python3
-"""Daily auto-post: pick a topic -> your Render API makes the video -> publish to a Facebook Page.
-
-Runs in one pass (Render free wipes files on sleep, so generate + upload must happen together).
-Env vars: see .github/workflows/daily-post.yml
-"""
-import datetime as dt
-import difflib
-import json
-import os
-import pathlib
-import random
-import re
-import sys
-import time
-
-import httpx
-
-API = os.environ["API_URL"].rstrip("/")            # https://<service>.onrender.com
-KEY = os.environ.get("ACCESS_KEY", "")             # same ACCESS_KEY you set on Render
-PAGE_ID = os.environ.get("FB_PAGE_ID", "").strip()
-PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN", "").strip()   # long-lived PAGE access token (leave empty for YouTube only)
-USE_FB = bool(PAGE_ID and PAGE_TOKEN) and os.environ.get("SKIP_FB", "").lower() != "true"  # False = YouTube only
-NICHE = os.environ.get("NICHE", "").strip()        # e.g. "personal finance tips for beginners"
-AUDIENCE = os.environ.get("AUDIENCE", "a general audience")
-LLM_KEY = os.environ.get("LLM_API_KEY", "")        # Groq key, used only to invent a fresh topic each day
-LLM_URL = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
-FB_MODE = os.environ.get("FB_MODE", "auto")        # auto = Reel when 90s or less, normal video when longer | reel | video
-FB_STATE = os.environ.get("FB_STATE", "PUBLISHED") # set DRAFT to test without going public
-DRY_RUN = os.environ.get("DRY_RUN", "") == "true"  # make the video but do not post
-DURATIONS = [int(x) for x in re.split(r"[,\s]+", os.environ.get("DURATIONS", "30,60,90")) if x in ("30", "60", "90", "120")] or [60]
-DURATION_CHOICE = os.environ.get("DURATION", "").strip()   # "30" | "60" | "90" | "120" | "" / "auto" = random from DURATIONS
-TOPIC_OVERRIDE = os.environ.get("TOPIC", "").strip()       # type a topic in "Run workflow" to force it: "black bear" or "topic | subject"
-STYLE = os.environ.get("STYLE", "cinematic")
-TONE = os.environ.get("TONE", "energetic")
-MUSIC_STYLE = os.environ.get("MUSIC_STYLE", "cinematic")
-FB_ASPECT = os.environ.get("FB_ASPECT", "9:16")
-GRAPH = "https://graph.facebook.com/v25.0"
-RUPLOAD = "https://rupload.facebook.com/video-upload/v25.0"
-H = {"X-Access-Key": KEY}
-THUMB_FILE = pathlib.Path(os.environ.get("THUMB_FILE", "thumbnail.jpg"))  # cover image made from the finished video
-HISTORY = pathlib.Path(os.environ.get("HISTORY_FILE", "data/posted.json"))  # every topic already posted
-
-
-def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, flush=True)
-
-
-# Details of this run, written to result.json at the end so notify.py can send a full report.
-RESULT_FILE = pathlib.Path(os.environ.get("RESULT_FILE", "result.json"))
-R: dict = {"started_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "stage": "starting",
-           "dry_run": False, "fb_state": os.environ.get("FB_STATE", "PUBLISHED")}
-
-
-def save_result() -> None:
-    R["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    try:
-        RESULT_FILE.write_text(json.dumps(R, indent=2, ensure_ascii=False), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def ok(r: httpx.Response, what: str) -> dict:
-    if r.status_code >= 400:
-        sys.exit(f"{what} failed ({r.status_code}): {r.text[:600]}")
-    return r.json()
-
-
-# ---------- 0. memory of what was already posted (so nothing repeats) ----------
-STOP = {"the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are", "how", "why", "what", "can",
-        "does", "do", "with", "your", "you", "it", "its", "that", "this", "from", "by", "at", "as"}
-
-
-def load_history() -> list[dict]:
-    try:
-        return json.loads(HISTORY.read_text(encoding="utf-8")).get("posts", [])
-    except (OSError, ValueError):
-        return []
-
-
-def save_history(posts: list[dict]) -> None:
-    HISTORY.parent.mkdir(parents=True, exist_ok=True)
-    HISTORY.write_text(json.dumps({"posts": posts}, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def _words(s: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z0-9]+", s.lower()) if w not in STOP}
-
-
-def too_similar(a: str, b: str) -> bool:
-    wa, wb = _words(a), _words(b)
-    if not wa or not wb:
-        return False
-    if wa == wb:
-        return True
-    jaccard = len(wa & wb) / len(wa | wb)
-    ratio = difflib.SequenceMatcher(None, " ".join(sorted(wa)), " ".join(sorted(wb))).ratio()
-    return jaccard >= 0.6 or ratio >= 0.85
-
-
-def already_covered(candidate: str, history: list[dict]) -> bool:
-    for p in history:
-        for old in (p.get("topic", ""), p.get("title", "")):
-            if old and too_similar(candidate, old):
-                return True
-    return False
-
-
-# ---------- 0b. small helpers: ask the LLM, keep the word "AI" out of the post ----------
-AI_WORDS = re.compile(r"\b(?:artificial intelligence|ai[- ]generated|ai[- ]made|ai[- ]powered|ai[- ]driven|made with ai|chat ?gpt|a\.i\.|ai|gpt|llm)\b", re.I)
-AI_TAG = re.compile(r"^(?:ai|artificialintelligence|chatgpt|gpt)(?:art|video|tools?|tech|generated|made|content|news|facts|voice)?$", re.I)
-
-
-def has_ai(text: str) -> bool:
-    return bool(AI_WORDS.search(text or ""))
-
-
-def safe(*options: str) -> str:
-    """First option that does not mention AI. Removing the word would leave broken sentences, so whole options are skipped."""
-    for o in options:
-        o = " ".join((o or "").split())
-        if o and not has_ai(o):
-            return o
-    return ""
-
-
-def llm_json(system: str, user: str, temperature: float = 0.7) -> dict | None:
-    if not LLM_KEY:
-        return None
-    try:
-        r = httpx.post(f"{LLM_URL}/chat/completions", headers={"Authorization": f"Bearer {LLM_KEY}"}, timeout=60,
-                       json={"model": LLM_MODEL, "temperature": temperature, "response_format": {"type": "json_object"},
-                             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
-        data = r.json()
-        if "choices" not in data:
-            log(f"LLM error ({r.status_code}):", r.text[:300])
-            return None
-        return json.loads(data["choices"][0]["message"]["content"])
-    except Exception as e:
-        log("LLM call failed:", e)
-        return None
-
-
-# Words stock-video tags almost never contain. Keeping them would make the footage search find nothing.
-FILLER = {"immortal", "ultra", "ultra-fast", "fast", "amazing", "incredible", "mysterious", "ancient", "legendary",
-          "deadly", "famous", "tiny", "huge", "rare", "strange", "unique", "powerful", "mighty", "secret", "hidden"}
-
-
-def clean_subject(s: str) -> str:
-    s = re.sub(r"[^A-Za-z0-9 '\-]", " ", s or "")
-    words = s.lower().split()[:3]
-    kept = [w for w in words if w not in FILLER]
-    return " ".join(kept or words).strip()
-
-
-def derive_subject(topic: str) -> str:
-    """The main visible thing the footage must show, e.g. 'black bear'. Empty when it can't be told."""
-    d = llm_json("You pick stock-video search terms. Reply with JSON only.",
-                 f'Topic: "{topic}". What is the ONE main visible subject that footage must show? Reply 1 to 3 simple, '
-                 'common English words a stock-video site would tag, e.g. "black bear", "volcano", "honey bee". '
-                 'Keep an adjective only if dropping it could show a different animal or thing (black bear, polar bear, red panda). '
-                 'Drop adjectives stock sites never tag, such as immortal, giant, tiny, ancient, ultra-fast (immortal jellyfish -> jellyfish). '
-                 'If the topic has no single visible subject, '
-                 'reply an empty string. JSON: {"subject": "..."}', 0.2)
-    return clean_subject((d or {}).get("subject", ""))
-
-
-def subject_aliases(subject: str, topic: str) -> list[str]:
-    """Other names stock sites might tag the same thing with (pistol shrimp -> snapping shrimp, alpheidae).
-    Footage is only accepted if it is tagged with the full subject OR one full alias, so this widens the search
-    without ever allowing a different animal or object."""
-    if not subject:
-        return []
-    d = llm_json("You help find stock footage. Reply with JSON only.",
-                 f'Topic: "{topic}". Main subject: "{subject}". List up to 4 OTHER names for exactly this same thing that '
-                 'video sites, Wikipedia or museums use as tags: common alternate names, plural or singular forms, and the '
-                 'scientific name if it is an animal or plant. Each is 1 to 3 words. Never list a related but different '
-                 'thing (a different species, a bigger category, a similar object). If there are none, return an empty list. '
-                 'JSON: {"aliases": ["..."]}', 0.1)
-    out = []
-    for a in (d or {}).get("aliases") or []:
-        a = clean_subject(str(a))
-        if a and a != subject and a not in out and not set(a.split()) < set(subject.split()):
-            out.append(a)  # a strict subset of the subject words ("shrimp" for "pistol shrimp") would be too broad
-    return out[:4]
-
-
-def parse_topic_line(line: str) -> dict:
-    """'topic | subject' or just 'topic' (subject is then worked out automatically)."""
-    topic, _, subj = line.partition("|")
-    topic, subj = topic.strip(), clean_subject(subj)
-    return {"topic": topic, "subject": subj or derive_subject(topic), "audience": AUDIENCE, "hashtags": []}
-
-
-def hashtag_list(raw: list, t: dict) -> list[str]:
-    tags, seen = [], set()
-    for h in list(raw or []):
-        w = re.sub(r"[^A-Za-z0-9]", "", str(h))
-        if not w or AI_TAG.match(w) or w.lower() in seen or len(w) > 30:
-            continue
-        seen.add(w.lower())
-        tags.append("#" + w)
-    if len(tags) < 4:  # top up from the subject / topic so the post is never left without tags
-        subj_words = _words(t.get("subject", ""))
-        extra = [t.get("subject", "").replace(" ", "")] + [w for w in sorted(_words(t["topic"]) - subj_words, key=len, reverse=True)[:3]]
-        extra += ["sciencefacts", "facts", "nature" if t.get("subject") else "science"]
-        for w in extra:
-            w = re.sub(r"[^A-Za-z0-9]", "", w)
-            if w and not AI_TAG.match(w) and w.lower() not in seen and len(tags) < 6:
-                seen.add(w.lower())
-                tags.append("#" + w)
-    return tags[:6]
-
-
-def add_credits(caption: str, meta: dict) -> str:
-    """Footage that requires attribution (e.g. Wikimedia CC BY) gets a credit line just above the hashtags."""
-    credits = sorted({v["credit"] for v in meta.values() if v.get("credit_required") and v.get("credit")})
-    if not credits:
-        return caption
-    line = "Footage: " + "; ".join(credits)
-    blocks = caption.split("\n\n")
-    blocks.insert(max(len(blocks) - 1, 1), line)
-    return "\n\n".join(blocks)
-
-
-def build_caption(t: dict, proj: dict) -> tuple[str, str]:
-    """Search-friendly title + caption + hashtags. Never mentions AI."""
-    sc = proj.get("script") or {}
-    subject = t.get("subject", "")
-    d = llm_json(
-        "You write Facebook Reel captions that rank in Facebook search and make people watch to the end. Reply JSON only.",
-        f"Topic: {t['topic']}\nMain subject: {subject or 'n/a'}\nWhat the video says: {sc.get('description', '')} {sc.get('hook', '')}\n"
-        f"Audience: {t.get('audience', AUDIENCE)}\n"
-        "Rules: 'title' is max 70 characters, starts with the main keyword, is a curiosity hook, no clickbait lies. "
-        "'caption' is 2 short sentences (max 220 characters) that naturally use the main keyword and one related keyword, "
-        "then ONE short question that invites comments. 'hashtags' is exactly 5 tags without '#': 2 specific to the subject, "
-        "2 broader topic tags, 1 format tag like sciencefacts or naturefacts. The question must be specific to the topic. "
-        "Never ask people to like, share, follow or tag anyone, and never write 'comment YES'. Never use the words AI, artificial intelligence, generated, "
-        "bot, or any AI-related hashtag. No emojis. "
-        'JSON: {"title": "...", "caption": "...", "hashtags": ["..."]}', 0.6) or {}
-    title = safe(d.get("title"), sc.get("title"), t["topic"], f"{subject.title()} explained" if subject else "", "Did you know?")[:90]
-    body = safe(d.get("caption"), sc.get("description"),
-                f"A quick look at {subject or 'this topic'} and what makes it so interesting. What should we cover next?")
-    if subject and not (set(subject.split()) & _words(title)):
-        title = f"{subject.title()}: {title}"[:90]
-    tags = hashtag_list(d.get("hashtags") or t.get("hashtags") or [], t)
-    return title, "\n\n".join(x for x in [title, body, " ".join(tags)] if x)
-
-
-# ---------- 1. topic (the automatic content idea) ----------
-def pick_topic(history: list[dict]) -> dict:
-    today = dt.date.today()
-    if TOPIC_OVERRIDE:
-        return parse_topic_line(TOPIC_OVERRIDE)
-    if NICHE and LLM_KEY:
-        covered = [x for p in history[-80:] for x in (p.get("topic", ""), p.get("title", "")) if x]
-        for attempt in range(5):  # ask again if the idea is a repeat
-            try:
-                avoid = "; ".join(dict.fromkeys(covered))[:3000] or "(nothing yet)"
-                r = httpx.post(
-                    f"{LLM_URL}/chat/completions",
-                    headers={"Authorization": f"Bearer {LLM_KEY}"},
-                    timeout=60,
-                    json={
-                        "model": LLM_MODEL,
-                        "temperature": 1.0,
-                        "response_format": {"type": "json_object"},
-                        "messages": [
-                            {"role": "system", "content": "You plan short educational social videos. Reply with JSON only."},
-                            {"role": "user", "content": (
-                                f"Niche: {NICHE}. "
-                                "Give ONE specific, well-established, factual, EVERGREEN video topic that is not generic, and not about artificial intelligence. "
-                                "It must still be true and interesting in a year: no news, no dates, no 'this week', 'today', 'latest' or 'new'. "
-                                "Pick a surprising angle that makes people curious, such as a record, a myth, or a 'how is this even possible' fact. "
-                                f"Already covered, so never repeat or closely overlap with these: {avoid}. "
-                                'JSON: {"topic": "...", "subject": "...", "audience": "...", "hashtags": ["a","b","c"]}. '
-                                '"subject" is the ONE main visible thing, 1 to 3 simple common words as a stock-video site would tag it. '
-                                'Keep an adjective only if dropping it could show a different animal or thing (e.g. "black bear", "polar bear", "red panda"). '
-                                'Drop adjectives stock sites never tag, such as immortal, giant, tiny, ancient, ultra-fast '
-                                '(e.g. "jellyfish", not "immortal jellyfish"; "volcano", "honey bee").')},
-                        ],
-                    },
-                )
-                data = r.json()
-                if "choices" not in data:
-                    log(f"LLM topic error ({r.status_code}):", r.text[:300])
-                    break
-                t = json.loads(data["choices"][0]["message"]["content"])
-                topic = t.get("topic", "").strip()
-                if len(topic) < 3:
-                    continue
-                if already_covered(topic, history):
-                    log("topic is a repeat, asking again:", topic)
-                    covered.append(topic)
-                    continue
-                t["topic"] = topic
-                t["subject"] = clean_subject(t.get("subject", "")) or derive_subject(topic)
-                t["audience"] = AUDIENCE  # always your own AUDIENCE setting, never one the model made up
-                return t
-            except Exception as e:  # fall back to the list
-                log("LLM topic failed:", e)
-                break
-    lines = [l.strip() for l in pathlib.Path("scripts/topics.txt").read_text().splitlines() if l.strip() and not l.startswith("#")]
-    fresh = [l for l in lines if not already_covered(l.split("|")[0], history)]
-    if not fresh:
-        sys.exit("No unused topics left (the AI topic step failed and topics.txt is used up). Add new lines to scripts/topics.txt. Nothing was posted.")
-    return parse_topic_line(fresh[today.toordinal() % len(fresh)])
-
-
-# ---------- 2. make the video on your Render backend ----------
-def wake_backend():
-    for i in range(12):  # free Render needs ~1 min to wake
-        try:
-            if httpx.get(f"{API}/api/health", timeout=90).status_code == 200:
-                log("backend awake")
-                return
-        except httpx.HTTPError:
-            pass
-        log("waiting for backend...", i)
-        time.sleep(20)
-    sys.exit("backend never woke up")
-
-
-def scenes_meta(assets: list[dict]) -> dict:
-    """Which footage each scene got, from the backend's /assets list (scene_01.png -> {source, note, ...}).
-    The project record itself does not carry this, which is why it must be read from /assets."""
-    return {a["name"]: a for a in assets if re.fullmatch(r"scene_\d{2}\.png", a.get("name", ""))}
-
-
-def footage_gaps(meta: dict) -> list[str]:
-    """Scenes that are NOT real footage. A scene is real only when a stock source or an AI video supplied it;
-    anything else is a placeholder graphic, whichever backend made it. An empty list of scenes is never OK."""
-    return sorted(k for k, v in meta.items() if not v.get("source") and not v.get("ai_generated"))
-
-
-def make_video(t: dict, duration: int) -> tuple[pathlib.Path, dict]:
-    body = {
-        "mode": "explainer", "topic": t["topic"][:500], "audience": t["audience"][:200],
-        "style": STYLE, "duration": duration, "language": "en-us",
-        "aspect_ratio": FB_ASPECT, "subject": t.get("subject", ""), "subject_aliases": t.get("aliases", []),
-        "tone": TONE, "voice": "auto", "voice_speed": 0.95,
-        "background_music": True, "music_style": MUSIC_STYLE, "sound_effects": True,
-    }
-    p = ok(httpx.post(f"{API}/api/projects", json=body, headers=H, timeout=60), "create project")
-    pid = p["id"]
-    job = ok(httpx.post(f"{API}/api/projects/{pid}/generate", headers=H, timeout=60), "start generation")
-    log("job", job["id"], "started for:", t["topic"])
-    deadline = time.time() + 75 * 60
-    while time.time() < deadline:
-        time.sleep(20)
-        j = ok(httpx.get(f"{API}/api/jobs/{job['id']}", headers=H, timeout=60), "poll job")
-        log(j["stage"], j["progress"], j["message"])
-        if j["status"] == "completed":
-            break
-        if j["status"] in ("failed", "cancelled"):
-            sys.exit(f"job {j['status']}: {j.get('error')}")
-    else:
-        sys.exit("timed out waiting for render")
-    proj = ok(httpx.get(f"{API}/api/projects/{pid}", headers=H, timeout=60), "get project")
-    assets = ok(httpx.get(f"{API}/api/projects/{pid}/assets", headers=H, timeout=60), "get footage list")
-    proj["assets_meta"] = scenes_meta(assets.get("assets") or [])
-    out = pathlib.Path("video.mp4")
-    with httpx.stream("GET", f"{API}/api/projects/{pid}/video", headers=H, timeout=300) as r:
-        if r.status_code >= 400:
-            sys.exit(f"video download failed ({r.status_code})")
-        with out.open("wb") as f:
-            for chunk in r.iter_bytes():
-                f.write(chunk)
-    log("video saved", out.stat().st_size // 1024, "KB")
-    return out, proj
-
-
-# ---------- 3a. make sure the token really belongs to the Page ----------
-def check_token():
-    r = httpx.get(f"{GRAPH}/me", params={"fields": "id,name", "access_token": PAGE_TOKEN}, timeout=30)
-    if r.status_code != 200:
-        sys.exit(f"FB_PAGE_TOKEN was rejected by Facebook ({r.status_code}): {r.text[:200]}")
-    me = r.json()
-    log(f"token belongs to: {me.get('name')} (id {me.get('id')}) | FB_PAGE_ID is {PAGE_ID}")
-    R["page_name"] = me.get("name") or ""
-    if str(me.get("id")) != str(PAGE_ID).strip():
-        sys.exit("FB_PAGE_TOKEN is not the Page token for FB_PAGE_ID. If the name above is a person, you saved a "
-                 "USER token. Get the Page token from me/accounts and update the FB_PAGE_TOKEN secret. Nothing was posted.")
-
-
-# ---------- 3. publish to the Facebook Page ----------
-def post_reel(path: pathlib.Path, caption: str, record):
-    start = ok(httpx.post(f"{GRAPH}/{PAGE_ID}/video_reels",
-                          data={"upload_phase": "start", "access_token": PAGE_TOKEN}, timeout=60), "reel start")
-    vid = start["video_id"]
-    up = httpx.post(start["upload_url"], timeout=900, content=path.read_bytes(),
-                    headers={"Authorization": f"OAuth {PAGE_TOKEN}", "offset": "0", "file_size": str(path.stat().st_size)})
-    ok(up, "reel upload")
-    fin = ok(httpx.post(f"{GRAPH}/{PAGE_ID}/video_reels", timeout=120, data={
-        "upload_phase": "finish", "video_id": vid, "video_state": FB_STATE,
-        "description": caption, "access_token": PAGE_TOKEN}), "reel publish")
-    log("reel finish:", fin)
-    record(vid)  # remembered immediately, even if the status check below fails
-    for _ in range(30):  # wait for Facebook to process it
-        resp = httpx.get(f"{GRAPH}/{vid}", params={"fields": "status", "access_token": PAGE_TOKEN}, timeout=60)
-        if resp.status_code >= 400:
-            # The reel was already accepted and recorded above. Not being able to READ its processing status
-            # (usually a missing permission) must not turn a successful post into a failed run.
-            log(f"WARNING: could not read the reel's processing status (HTTP {resp.status_code}). "
-                "The reel was accepted by Facebook; check your Page to confirm it appears.")
-            R["fb_status"] = f"could not be checked (HTTP {resp.status_code}); Facebook accepted the reel and is processing it"
-            break
-        s = resp.json()
-        log("fb status:", s.get("status"))
-        R["fb_status"] = json.dumps(s.get("status", {}), ensure_ascii=False)[:400]
-        st = json.dumps(s.get("status", {}))
-        if '"ready"' in st or '"published"' in st or "error" in st:
-            break
-        time.sleep(10)
-    set_fb_thumbnail(vid)
-
-
-def set_fb_thumbnail(video_id: str) -> None:
-    """Best effort: ask Facebook to use our cover image for the reel. A failure never fails the run."""
-    if not THUMB_FILE.is_file():
-        return
-    try:
-        with THUMB_FILE.open("rb") as f:
-            r = httpx.post(f"{GRAPH}/{video_id}/thumbnails", timeout=120,
-                           data={"is_preferred": "true", "access_token": PAGE_TOKEN}, files={"source": f})
-        if r.status_code < 400:
-            R["thumbnail"] = "made and sent to Facebook"
-            log("facebook thumbnail set")
-        else:
-            R["thumbnail"] = f"made, but Facebook did not accept it (HTTP {r.status_code}); it keeps its automatic cover"
-            log("facebook thumbnail not accepted:", r.status_code, r.text[:200])
-    except Exception as e:  # noqa: BLE001
-        R["thumbnail"] = f"made, but sending it to Facebook failed ({type(e).__name__})"
-        log("facebook thumbnail failed:", e)
-
-
-def post_video(path: pathlib.Path, title: str, caption: str, record):
-    with path.open("rb") as f:
-        r = httpx.post(f"{GRAPH}/{PAGE_ID}/videos", timeout=900, files={"source": f}, data={
-            "title": title[:100], "description": caption, "published": "true" if FB_STATE == "PUBLISHED" else "false",
-            "access_token": PAGE_TOKEN})
-    res = ok(r, "video post")
-    log("video posted:", res)
-    record(res.get("id", ""))
-
-
-def pick_duration() -> int:
-    return int(DURATION_CHOICE) if DURATION_CHOICE in ("30", "60", "90", "120") else random.choice(DURATIONS)
-
-
-def main():
-    R["dry_run"] = DRY_RUN
-    if USE_FB and not DRY_RUN:
-        R["stage"] = "checking the Facebook token"
-        check_token()  # fail fast, before spending minutes on a video
-    elif not USE_FB:
-        log("Facebook is off (no FB secrets or SKIP_FB=true): making the video for YouTube only")
-    R["stage"] = "choosing a topic"
-    history = load_history()
-    log(f"{len(history)} earlier posts on record")
-    R["earlier_posts"] = len(history)
-    t = pick_topic(history)
-    duration = pick_duration()
-    as_reel = FB_MODE in ("reel", "auto") and duration <= 90  # Facebook Reels must be 3 to 90 seconds
-    log(f"topic: {t['topic']} | subject: {t.get('subject') or '-'} | {duration}s | {'reel' if as_reel else 'normal video'}")
-    R.update(topic=t["topic"], subject=t.get("subject", ""), duration_s=duration, format="Reel" if as_reel else "Normal video")
-    t["aliases"] = subject_aliases(t.get("subject", ""), t["topic"])
-    if t["aliases"]:
-        log("other names for the subject:", ", ".join(t["aliases"]))
-    R["stage"] = "making the video (voice, footage, music)"
-    wake_backend()
-    t0 = time.time()
-    path, proj = make_video(t, duration)
-    R["render_seconds"] = round(time.time() - t0)
-    R["video_mb"] = round(path.stat().st_size / 1048576, 1)
-    meta = proj.get("assets_meta") or {}
-    def scene_line(v: dict) -> str:
-        src = v.get("source") or "none"
-        link = f" -> {v['source_url']}" if v.get("source_url") else ""
-        return f"[{src}] {str(v.get('tags') or v.get('note') or '-')[:160]}{link}"
-    R["scenes"] = [{"scene": k, "footage": scene_line(v)[:420], "searched": str(v.get("searched") or "")[:200]}
-                   for k, v in sorted(meta.items())]
-    for k, v in sorted(meta.items()):  # shows what footage each scene got, so you can check it matches the subject
-        log(f"  {k}: {scene_line(v)}")
-        if v.get("searched"):
-            log(f"      sources searched: {v['searched']}")
-    # A scene is real footage only when a stock source supplied it (or AI made it). Anything else is a placeholder
-    # graphic, whichever backend produced it, and a video with one must never be posted.
-    if not meta:  # never post a video whose footage could not be checked
-        sys.exit("Could not read which footage each scene used, so the video was not posted (the topic is not used up).")
-    gaps = footage_gaps(meta)
-    if gaps:
-        for k in sorted(gaps):
-            log(f"  NO FOOTAGE {k}: {meta[k].get('note')}")  # says which sources were searched and what each returned
-        # Also in a dry run: stops the private YouTube test from uploading a placeholder video.
-        sys.exit(("(dry run) " if DRY_RUN else "") + f"{len(gaps)} scene(s) found no matching footage and would show a "
-                 "placeholder graphic. Not posting this one" + ("." if DRY_RUN else "; the topic is not used up, so the next run picks again."))
-    R["stage"] = "writing the title, caption and hashtags"
-    title, caption = build_caption(t, proj)
-    caption = add_credits(caption, meta)
-    log("caption:\n" + caption)
-    R.update(title=title, caption=caption, hashtags=re.findall(r"#\w+", caption.splitlines()[-1] if caption else ""))
-    try:
-        import thumbnail
-        thumbnail.make_thumbnail(path, title, THUMB_FILE)
-        R["thumbnail"] = "made"
-        log("thumbnail made:", THUMB_FILE)
-    except Exception as e:  # noqa: BLE001  a missing cover must never stop the post
-        THUMB_FILE.unlink(missing_ok=True)
-        R["thumbnail"] = f"not made ({type(e).__name__}: {str(e)[:80]})"
-        log("thumbnail not made:", e)
-    if DRY_RUN:
-        log("DRY_RUN on: not posting")
-        return
-    history = load_history()  # last check right before posting, in case another run finished meanwhile
-    if already_covered(t["topic"], history) or already_covered(title, history):
-        sys.exit("This topic was already posted. Skipping so nothing repeats.")
-
-    def record(video_id: str):
-        R["video_id"] = video_id
-        R["posted_at"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-        save_history(load_history() + [{
-            "topic": t["topic"], "subject": t.get("subject", ""), "title": title, "video_id": video_id,
-            "state": FB_STATE, "mode": "reel" if as_reel else "video", "seconds": duration,
-            "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}])
-        log("recorded in", HISTORY)
-
-    t1 = time.time()
-    if USE_FB:
-        R["stage"] = "uploading to Facebook"
-        if as_reel:
-            post_reel(path, caption, record)
-        else:
-            post_video(path, title, caption, record)
-    else:
-        R["stage"] = "video ready for YouTube"
-        record("")  # remember the topic; the next workflow step (youtube_upload.py) does the actual upload
-    R["upload_seconds"] = round(time.time() - t1)
-    R["stage"] = "done"
-    log("done")
-
-
-if __name__ == "__main__":
-    try:
-        main()
-        if R.get("stage") != "done" and R.get("dry_run"):
-            R["stage"] = "done"
-    except SystemExit as e:  # sys.exit("message") is how this script reports a failure
-        if e.code not in (None, 0):
-            R["error"] = str(e.code)[:1500]
-        raise
-    except Exception as e:
-        R["error"] = f"{type(e).__name__}: {e}"[:1500]
-        raise
-    finally:
-        save_result()
+name: Daily YouTube post
+
+on:
+  schedule:
+    - cron: "0 4,12 * * *"   # UTC. 04:00 and 12:00 UTC = 12:00 PM and 8:00 PM in UTC+8 (Philippines).
+  workflow_dispatch:           # lets you run it by hand from the Actions tab
+    inputs:
+      privacy:                 # CHANGED: replaces dry_run / youtube_test. Use "private" to test safely.
+        description: "YouTube privacy for this run (scheduled runs use the YT_PRIVACY variable, default public)"
+        type: choice
+        options: [public, unlisted, private]
+        default: private
+      quality:
+        description: "Video quality: standard (720p) or high (1080p)"
+        type: choice
+        options: [standard, high]
+        default: standard
+      duration:
+        description: "Length in seconds (auto = random pick of 30 / 60 / 90)"
+        type: choice
+        options: [auto, "30", "60", "90", "120"]
+        default: auto
+      music:
+        description: "Built-in music style (ignored if assets/music has your own tracks)"
+        type: choice
+        options: [cinematic, epic, upbeat, calm, playful]
+        default: cinematic
+      topic:
+        description: "Optional: force a topic, e.g. black bear   (or: topic | subject)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write          # lets the job save the list of posted topics back to the repo
+
+concurrency:
+  group: daily-post
+  cancel-in-progress: false   # a second run waits for the first instead of overlapping
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install FFmpeg and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
+          pip install -r backend/requirements.txt
+
+      - name: Start backend on the runner and make the video
+        id: post
+        env:
+          # ---- backend settings (same values as render.yaml) ----
+          ACCESS_KEY: ${{ secrets.ACCESS_KEY }}
+          LLM_BACKEND: api
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: openai/gpt-oss-120b
+          LLM_FALLBACK_BACKENDS: "hf_api"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          LLM_FALLBACK_MODELS: openai/gpt-oss-20b,llama-3.1-8b-instant
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          IMAGE_BACKEND: stock
+          STOCK_PROVIDERS: nasa,wikimedia,archive,smithsonian,pixabay,pexels
+          STOCK_AI_FALLBACK: "true"
+          STOCK_CONTACT: ${{ vars.STOCK_CONTACT }}
+          SMITHSONIAN_API_KEY: ${{ secrets.SMITHSONIAN_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          TTS_BACKEND: cloudflare
+          TTS_FALLBACK: kokoro
+          TTS_FALLBACK_INSTALL: "true"
+          VIDEO_BACKEND: none
+          FFMPEG_THREADS: "2"
+          KEN_BURNS: "true"
+          VIDEO_QUALITY: ${{ github.event.inputs.quality || 'standard' }}
+          MAX_CONCURRENT_JOBS: "1"
+          MAX_QUEUE: "1"
+          STORAGE_LIMIT_MB: "2000"
+          # ---- posting settings ----
+          API_URL: http://127.0.0.1:8000
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}        # not used now, kept in case the script still reads it
+          FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}  # not used now, kept in case the script still reads it
+          NICHE: ${{ vars.NICHE }}
+          AUDIENCE: ${{ vars.AUDIENCE }}
+          FB_MODE: auto
+          STYLE: cinematic
+          TONE: energetic
+          MUSIC_STYLE: ${{ github.event.inputs.music || 'cinematic' }}
+          MUSIC_DIR: ${{ github.workspace }}/assets/music
+          DURATIONS: "30,60,90"
+          DURATION: ${{ github.event.inputs.duration }}
+          TOPIC: ${{ github.event.inputs.topic }}
+          FB_STATE: PUBLISHED
+          DRY_RUN: "true"                  # CHANGED: always "make the video but do not post" -> nothing goes to Facebook
+        run: |
+          cd backend
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > ../backend.log 2>&1 &
+          cd ..
+          for i in $(seq 1 30); do
+            curl -fs http://127.0.0.1:8000/api/health > /dev/null && break
+            sleep 2
+          done
+          set -o pipefail
+          python scripts/daily_post.py 2>&1 | tee run.log
+
+      - name: Backend log (only when something failed)
+        if: failure()
+        run: tail -n 100 backend.log
+
+      - name: Save the list of posted topics
+        if: always()                       # CHANGED: no more dry_run check
+        run: |
+          if [ -n "$(git status --porcelain data/posted.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/posted.json
+            git commit -m "Record posted topic [skip ci]"
+            git pull --rebase
+            git push
+          fi
+
+      - name: Upload the video to YouTube
+        id: youtube
+        if: steps.post.outcome == 'success'   # CHANGED: runs on every successful video
+        timeout-minutes: 20
+        continue-on-error: true
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_PRIVACY: ${{ github.event.inputs.privacy || vars.YT_PRIVACY || 'public' }}   # CHANGED
+        run: |
+          python scripts/youtube_upload.py 2>&1 | tee -a run.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" = "2" ]; then exit 0; fi   # 2 = no YouTube secrets set yet, simply skip
+          exit "$rc"
+
+      - name: Keep the video for download
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-video
+          path: |
+            video.mp4
+            thumbnail.jpg
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Send me a detailed Telegram report
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OUTCOME: ${{ steps.post.outcome }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python scripts/notify.py
